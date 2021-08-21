@@ -1,50 +1,72 @@
 package httpntlm
 
 import (
+	"crypto/tls"
 	"errors"
+	"fmt"
 	"io"
 	"io/ioutil"
 	"net/http"
+	"net/http/cookiejar"
+	"net/url"
 	"strings"
+	"time"
 
-	"github.com/vadimi/go-ntlm/ntlm"
+	"github.com/sensepost/ruler/utils"
+	"github.com/staaldraad/go-ntlm/ntlm"
 )
-
-var errEmptyNtlm = errors.New("empty NTLM challenge")
 
 // NtlmTransport is implementation of http.RoundTripper interface
 type NtlmTransport struct {
-	Domain   string
-	User     string
-	Password string
-	http.RoundTripper
-	Jar http.CookieJar
+	Domain    string
+	User      string
+	Password  string
+	Proxy     string
+	NTHash    []byte
+	Insecure  bool
+	CookieJar *cookiejar.Jar
+	Hostname  string
 }
+
+var Transport http.Transport
 
 // RoundTrip method send http request and tries to perform NTLM authentication
 func (t NtlmTransport) RoundTrip(req *http.Request) (res *http.Response, err error) {
-	client := http.Client{}
-	if t.RoundTripper != nil {
-		client.Transport = t.RoundTripper
+
+	session, err := ntlm.CreateClientSession(ntlm.Version1, ntlm.ConnectionlessMode)
+	if err != nil {
+		return nil, err
 	}
 
-	if t.Jar != nil {
-		client.Jar = t.Jar
+	session.SetUserInfo(t.User, t.Password, t.Domain)
+
+	if len(t.NTHash) > 0 {
+		session.SetNTHash(t.NTHash)
 	}
 
-	resp, err := t.ntlmRoundTrip(client, req)
-	// retry once in case of an empty ntlm challenge
-	if err != nil && errors.Is(err, errEmptyNtlm) {
-		return t.ntlmRoundTrip(client, req)
-	}
-
-	return resp, err
-}
-
-func (t NtlmTransport) ntlmRoundTrip(client http.Client, req *http.Request) (*http.Response, error) {
+	b, _ := session.GenerateNegotiateMessage()
 	// first send NTLM Negotiate header
 	r, _ := http.NewRequest("GET", req.URL.String(), strings.NewReader(""))
-	r.Header.Add("Authorization", "NTLM "+encBase64(negotiate()))
+	r.Header.Add("Authorization", "NTLM " + utils.EncBase64(b.Bytes()))
+	r.Header.Add("User-Agent", req.UserAgent())
+
+	if t.Proxy == "" {
+		Transport = http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: t.Insecure},
+		}
+	} else {
+		proxyURL, e := url.Parse(t.Proxy)
+		if e != nil {
+			return nil, fmt.Errorf("Invalid proxy url format %s", e)
+		}
+		Transport = http.Transport{Proxy: http.ProxyURL(proxyURL),
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: t.Insecure},
+		}
+	}
+
+	tr := &Transport
+
+	client := http.Client{Transport: tr, Timeout: time.Minute, Jar: t.CookieJar}
 
 	resp, err := client.Do(r)
 	if err != nil {
@@ -52,6 +74,7 @@ func (t NtlmTransport) ntlmRoundTrip(client http.Client, req *http.Request) (*ht
 	}
 
 	if err == nil && resp.StatusCode == http.StatusUnauthorized {
+
 		// it's necessary to reuse the same http connection
 		// in order to do that it's required to read Body and close it
 		_, err = io.Copy(ioutil.Discard, resp.Body)
@@ -63,44 +86,26 @@ func (t NtlmTransport) ntlmRoundTrip(client http.Client, req *http.Request) (*ht
 			return nil, err
 		}
 
-		// retrieve Www-Authenticate header from response
-		authHeaders := resp.Header.Values("WWW-Authenticate")
-		if len(authHeaders) == 0 {
-			return nil, errors.New("WWW-Authenticate header missing")
-		}
-
-		// there could be multiple WWW-Authenticate headers, so we need to pick the one that starts with NTLM
-		ntlmChallengeFound := false
-		var ntlmChallengeString string
-		for _, h := range authHeaders {
-			if strings.HasPrefix(h, "NTLM") {
-				ntlmChallengeFound = true
-				ntlmChallengeString = strings.TrimSpace(h[4:])
-				break
+		// retrieve WWW-Authenticate header from response
+		ntlmChallengeHeader := ""
+		for _, header := range resp.Header[http.CanonicalHeaderKey("WWW-Authenticate")] {
+			if strings.HasPrefix(header, "NTLM") {
+				ntlmChallengeHeader = header
 			}
 		}
-		if ntlmChallengeString == "" {
-			if ntlmChallengeFound {
-				return nil, errEmptyNtlm
-			}
-
-			return nil, errors.New("wrong WWW-Authenticate header")
+		if ntlmChallengeHeader == "" {
+			return nil, errors.New("Wrong WWW-Authenticate header")
 		}
 
-		challengeBytes, err := decBase64(ntlmChallengeString)
+		ntlmChallengeString := strings.Replace(ntlmChallengeHeader, "NTLM ", "", -1)
+		challengeBytes, err := utils.DecBase64(ntlmChallengeString)
 		if err != nil {
 			return nil, err
 		}
-
-		session, err := ntlm.CreateClientSession(ntlm.Version2, ntlm.ConnectionlessMode)
-		if err != nil {
-			return nil, err
-		}
-
-		session.SetUserInfo(t.User, t.Password, t.Domain)
 
 		// parse NTLM challenge
 		challenge, err := ntlm.ParseChallengeMessage(challengeBytes)
+
 		if err != nil {
 			return nil, err
 		}
@@ -112,14 +117,19 @@ func (t NtlmTransport) ntlmRoundTrip(client http.Client, req *http.Request) (*ht
 
 		// authenticate user
 		authenticate, err := session.GenerateAuthenticateMessage()
+		//fmt.Printf("%x\n", authenticate.Bytes())
+		if err != nil {
+			return nil, err
+		}
+		authenticate.Workstation, err = ntlm.CreateStringPayload(t.Hostname)
 		if err != nil {
 			return nil, err
 		}
 
 		// set NTLM Authorization header
-		req.Header.Set("Authorization", "NTLM "+encBase64(authenticate.Bytes()))
-		return client.Do(req)
-	}
+		req.Header.Set("Authorization", "NTLM " + utils.EncBase64(authenticate.Bytes()))
 
+		resp, err = client.Do(req)
+	}
 	return resp, err
 }
